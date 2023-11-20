@@ -2274,8 +2274,101 @@ def normalize_prefetch_lookups(lookups, prefix=None):
         ret.append(lookup)
     return ret
 
+#### REFACTOR START
+
+def normalize_prefetch_lookups(lookups, prefetch_to=None):
+    """
+    Normalize prefetch lookups, ensuring they are all `Prefetch` instances.
+    """
+    normalized_lookups = []
+    for lookup in lookups:
+        if isinstance(lookup, Prefetch):
+            normalized_lookups.append(lookup)
+        else:
+            normalized_lookups.append(Prefetch(lookup, queryset=None, to_attr=prefetch_to))
+    return normalized_lookups
+
+class Prefetch(object):
+    def __init__(self, lookup, queryset=None, to_attr=None):
+        self.lookup = lookup
+        self.queryset = queryset
+        self.to_attr = to_attr
+
+    def get_prefetch_to(self, level):
+        if isinstance(self.to_attr, list):
+            return self.to_attr[level]
+        else:
+            return self.to_attr
+
+    def get_current_to_attr(self, level):
+        if isinstance(self.to_attr, list):
+            return (self.to_attr[level],)
+        else:
+            return (self.to_attr,)
+
+def get_prefetcher(obj, through_attr, to_attr):
+    """
+    Retrieve the appropriate prefetcher for the given object and relationship.
+    """
+    descriptor = obj._meta.get_field(through_attr)
+    if not descriptor.is_related:
+        raise ValueError(
+            "%s is not a relationship field." % through_attr
+        )
+
+    prefetcher = getattr(descriptor, "prefetch_related_objects", None)
+    attr_found = hasattr(obj, to_attr)
+    is_fetched = lambda obj: hasattr(obj, "_prefetched_objects_cache") and to_attr in obj._prefetched_objects_cache
+
+    return prefetcher, descriptor, attr_found, is_fetched
+
+def prefetch_one_level(obj_list, prefetcher, lookup, level):
+    """
+    Prefetch one level of related objects for the given objects.
+    """
+    fetched_objects, additional_lookups = prefetcher(obj_list)
+
+    prefetch_to = lookup.get_current_prefetch_to(level)
+    for obj, related_objects in zip(obj_list, fetched_objects):
+        obj._prefetched_objects_cache.setdefault(prefetch_to, []).extend(related_objects)
+
+    return fetched_objects, additional_lookups
 
 def prefetch_related_objects(model_instances, *related_lookups):
+    """
+    Populate prefetched object caches for a list of model instances based on
+    the lookups/Prefetch instances given.
+    """
+    if not model_instances:
+        return  # nothing to do
+
+    # Normalize lookups and store them in a dictionary for easy access.
+    lookup_dict = {}
+    for lookup in normalize_prefetch_lookups(related_lookups):
+        lookup_dict[lookup.prefetch_to] = lookup
+
+    # Iterate through the nesting levels of related objects.
+    for level in range(len(related_lookups)):
+        # Filter objects that need prefetching at this level.
+        obj_list = [obj for obj in model_instances if not is_fetched(obj, level)]
+        if not obj_list:
+            continue
+
+        # Retrieve the prefetch_to attribute for the current level.
+        prefetch_to = get_prefetch_to(lookup_dict[level], level)
+
+        # Prepare objects for prefetching.
+        for obj in obj_list:
+            # If the object hasn't been prepared yet, create the cache.
+            if not hasattr(obj, "_prefetched_objects_cache"):
+                obj._prefetched_objects_cache = {}
+
+            # Retrieve the related
+
+
+#### REFACTOR END
+
+# def prefetch_related_objects(model_instances, *related_lookups):
     """
     Populate prefetched object caches for a list of model instances based on
     the lookups/Prefetch instances given.
