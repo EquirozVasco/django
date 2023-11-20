@@ -23,8 +23,9 @@ end in April 2024.
 Python compatibility
 ====================
 
-Django 4.2 supports Python 3.8, 3.9, 3.10, and 3.11. We **highly recommend**
-and only officially support the latest release of each series.
+Django 4.2 supports Python 3.8, 3.9, 3.10, 3.11, and 3.12 (as of 4.2.8). We
+**highly recommend** and only officially support the latest release of each
+series.
 
 .. _whats-new-4.2:
 
@@ -522,7 +523,7 @@ During the deprecation period string literals will be attempted to be JSON
 decoded and a warning will be emitted on success that points at passing
 non-encoded forms instead.
 
-Code that use to pass JSON encoded string literals::
+Code that used to pass JSON encoded string literals::
 
     Document.objects.bulk_create(
         Document(data=Value("null")),

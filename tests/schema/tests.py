@@ -2,6 +2,7 @@ import datetime
 import itertools
 import unittest
 from copy import copy
+from decimal import Decimal
 from unittest import mock
 
 from django.core.exceptions import FieldError
@@ -52,7 +53,7 @@ from django.db.models import (
     Value,
 )
 from django.db.models.fields.json import KT, KeyTextTransform
-from django.db.models.functions import Abs, Cast, Collate, Lower, Random, Upper
+from django.db.models.functions import Abs, Cast, Collate, Lower, Random, Round, Upper
 from django.db.models.indexes import IndexExpression
 from django.db.transaction import TransactionManagementError, atomic
 from django.test import TransactionTestCase, skipIfDBFeature, skipUnlessDBFeature
@@ -221,6 +222,18 @@ class SchemaTests(TransactionTestCase):
             if details["columns"] == [column_name]:
                 constraints_for_column.append(name)
         return sorted(constraints_for_column)
+
+    def get_constraint_opclasses(self, constraint_name):
+        with connection.cursor() as cursor:
+            sql = """
+                SELECT opcname
+                FROM pg_opclass AS oc
+                JOIN pg_index as i on oc.oid = ANY(i.indclass)
+                JOIN pg_class as c on c.oid = i.indexrelid
+                WHERE c.relname = %s
+            """
+            cursor.execute(sql, [constraint_name])
+            return [row[0] for row in cursor.fetchall()]
 
     def check_added_field_default(
         self,
@@ -816,7 +829,11 @@ class SchemaTests(TransactionTestCase):
     def test_add_generated_field_with_kt_model(self):
         class GeneratedFieldKTModel(Model):
             data = JSONField()
-            status = GeneratedField(expression=KT("data__status"), db_persist=True)
+            status = GeneratedField(
+                expression=KT("data__status"),
+                output_field=TextField(),
+                db_persist=True,
+            )
 
             class Meta:
                 app_label = "schema"
@@ -828,6 +845,23 @@ class SchemaTests(TransactionTestCase):
             any("None" in query["sql"] for query in ctx.captured_queries),
             False,
         )
+
+    @isolate_apps("schema")
+    @skipUnlessDBFeature("supports_stored_generated_columns")
+    def test_add_generated_field(self):
+        class GeneratedFieldOutputFieldModel(Model):
+            price = DecimalField(max_digits=7, decimal_places=2)
+            vat_price = GeneratedField(
+                expression=Round(F("price") * Value(Decimal("1.22")), 2),
+                db_persist=True,
+                output_field=DecimalField(max_digits=8, decimal_places=2),
+            )
+
+            class Meta:
+                app_label = "schema"
+
+        with connection.schema_editor() as editor:
+            editor.create_model(GeneratedFieldOutputFieldModel)
 
     @isolate_apps("schema")
     def test_add_auto_field(self):
@@ -1386,6 +1420,40 @@ class SchemaTests(TransactionTestCase):
 
     @isolate_apps("schema")
     @unittest.skipUnless(connection.vendor == "postgresql", "PostgreSQL specific")
+    @skipUnlessDBFeature("supports_collation_on_charfield")
+    def test_unique_with_deterministic_collation_charfield(self):
+        deterministic_collation = connection.features.test_collations.get(
+            "deterministic"
+        )
+        if not deterministic_collation:
+            self.skipTest("This backend does not support deterministic collations.")
+
+        class CharModel(Model):
+            field = CharField(db_collation=deterministic_collation, unique=True)
+
+            class Meta:
+                app_label = "schema"
+
+        # Create the table.
+        with connection.schema_editor() as editor:
+            editor.create_model(CharModel)
+        self.isolated_local_models = [CharModel]
+        constraints = self.get_constraints_for_column(
+            CharModel, CharModel._meta.get_field("field").column
+        )
+        self.assertIn("schema_charmodel_field_8b338dea_like", constraints)
+        self.assertIn(
+            "varchar_pattern_ops",
+            self.get_constraint_opclasses("schema_charmodel_field_8b338dea_like"),
+        )
+        self.assertEqual(
+            self.get_column_collation(CharModel._meta.db_table, "field"),
+            deterministic_collation,
+        )
+        self.assertIn("field", self.get_uniques(CharModel._meta.db_table))
+
+    @isolate_apps("schema")
+    @unittest.skipUnless(connection.vendor == "postgresql", "PostgreSQL specific")
     @skipUnlessDBFeature(
         "supports_collation_on_charfield",
         "supports_non_deterministic_collations",
@@ -1417,6 +1485,61 @@ class SchemaTests(TransactionTestCase):
         self.assertEqual(
             self.get_column_collation(CiCharModel._meta.db_table, "field"),
             ci_collation,
+        )
+        self.assertIn("field_id", self.get_uniques(RelationModel._meta.db_table))
+
+    @isolate_apps("schema")
+    @unittest.skipUnless(connection.vendor == "postgresql", "PostgreSQL specific")
+    @skipUnlessDBFeature("supports_collation_on_charfield")
+    def test_relation_to_deterministic_collation_charfield(self):
+        deterministic_collation = connection.features.test_collations.get(
+            "deterministic"
+        )
+        if not deterministic_collation:
+            self.skipTest("This backend does not support deterministic collations.")
+
+        class CharModel(Model):
+            field = CharField(db_collation=deterministic_collation, unique=True)
+
+            class Meta:
+                app_label = "schema"
+
+        class RelationModel(Model):
+            field = OneToOneField(CharModel, CASCADE, to_field="field")
+
+            class Meta:
+                app_label = "schema"
+
+        # Create the table.
+        with connection.schema_editor() as editor:
+            editor.create_model(CharModel)
+            editor.create_model(RelationModel)
+        self.isolated_local_models = [CharModel, RelationModel]
+        constraints = self.get_constraints_for_column(
+            CharModel, CharModel._meta.get_field("field").column
+        )
+        self.assertIn("schema_charmodel_field_8b338dea_like", constraints)
+        self.assertIn(
+            "varchar_pattern_ops",
+            self.get_constraint_opclasses("schema_charmodel_field_8b338dea_like"),
+        )
+        rel_constraints = self.get_constraints_for_column(
+            RelationModel, RelationModel._meta.get_field("field").column
+        )
+        self.assertIn("schema_relationmodel_field_id_395fbb08_like", rel_constraints)
+        self.assertIn(
+            "varchar_pattern_ops",
+            self.get_constraint_opclasses(
+                "schema_relationmodel_field_id_395fbb08_like"
+            ),
+        )
+        self.assertEqual(
+            self.get_column_collation(RelationModel._meta.db_table, "field_id"),
+            deterministic_collation,
+        )
+        self.assertEqual(
+            self.get_column_collation(CharModel._meta.db_table, "field"),
+            deterministic_collation,
         )
         self.assertIn("field_id", self.get_uniques(RelationModel._meta.db_table))
 
@@ -2137,6 +2260,23 @@ class SchemaTests(TransactionTestCase):
             editor.alter_field(AuthorDbDefault, old_field, new_field, strict=True)
         columns = self.column_classes(AuthorDbDefault)
         self.assertEqual(columns["renamed_year"][1].default, "1985")
+
+    @isolate_apps("schema")
+    def test_add_field_both_defaults_preserves_db_default(self):
+        class Author(Model):
+            class Meta:
+                app_label = "schema"
+
+        with connection.schema_editor() as editor:
+            editor.create_model(Author)
+
+        field = IntegerField(default=1985, db_default=1988)
+        field.set_attributes_from_name("birth_year")
+        field.model = Author
+        with connection.schema_editor() as editor:
+            editor.add_field(Author, field)
+        columns = self.column_classes(Author)
+        self.assertEqual(columns["birth_year"][1].default, "1988")
 
     @skipUnlessDBFeature(
         "supports_column_check_constraints", "can_introspect_check_constraints"

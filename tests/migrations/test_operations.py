@@ -1,4 +1,5 @@
 import math
+from decimal import Decimal
 
 from django.core.exceptions import FieldDoesNotExist
 from django.db import IntegrityError, connection, migrations, models, transaction
@@ -1691,15 +1692,22 @@ class OperationTests(OperationTestBase):
         field = new_state.models[app_label, "pony"].fields["height"]
         self.assertEqual(field.default, 3)
         self.assertEqual(field.db_default, Value(4))
-        project_state.apps.get_model(app_label, "pony").objects.create(weight=4)
+        pre_pony_pk = (
+            project_state.apps.get_model(app_label, "pony").objects.create(weight=4).pk
+        )
         self.assertColumnNotExists(table_name, "height")
         # Add field.
         with connection.schema_editor() as editor:
             operation.database_forwards(app_label, editor, project_state, new_state)
         self.assertColumnExists(table_name, "height")
+        post_pony_pk = (
+            project_state.apps.get_model(app_label, "pony").objects.create(weight=10).pk
+        )
         new_model = new_state.apps.get_model(app_label, "pony")
-        old_pony = new_model.objects.get()
-        self.assertEqual(old_pony.height, 4)
+        pre_pony = new_model.objects.get(pk=pre_pony_pk)
+        self.assertEqual(pre_pony.height, 4)
+        post_pony = new_model.objects.get(pk=post_pony_pk)
+        self.assertEqual(post_pony.height, 4)
         new_pony = new_model.objects.create(weight=5)
         if not connection.features.can_return_columns_from_insert:
             new_pony.refresh_from_db()
@@ -2209,6 +2217,43 @@ class OperationTests(OperationTestBase):
             operation.database_backwards(app_label, editor, new_state, project_state)
         pony = project_state.apps.get_model(app_label, "pony").objects.create(weight=1)
         self.assertIsNone(pony.green)
+
+    def test_alter_field_change_nullable_to_decimal_database_default_not_null(self):
+        app_label = "test_alflcntdddn"
+        project_state = self.set_up_test_model(app_label)
+        operation_1 = migrations.AddField(
+            "Pony",
+            "height",
+            models.DecimalField(null=True, max_digits=5, decimal_places=2),
+        )
+        operation_2 = migrations.AlterField(
+            "Pony",
+            "height",
+            models.DecimalField(
+                max_digits=5, decimal_places=2, db_default=Decimal("12.22")
+            ),
+        )
+        table_name = f"{app_label}_pony"
+        self.assertColumnNotExists(table_name, "height")
+        # Add field.
+        new_state = project_state.clone()
+        operation_1.state_forwards(app_label, new_state)
+        with connection.schema_editor() as editor:
+            operation_1.database_forwards(app_label, editor, project_state, new_state)
+        self.assertColumnExists(table_name, "height")
+        old_pony = new_state.apps.get_model(app_label, "pony").objects.create(weight=1)
+        self.assertIsNone(old_pony.height)
+        # Alter field.
+        project_state, new_state = new_state, new_state.clone()
+        operation_2.state_forwards(app_label, new_state)
+        with connection.schema_editor() as editor:
+            operation_2.database_forwards(app_label, editor, project_state, new_state)
+        old_pony.refresh_from_db()
+        self.assertEqual(old_pony.height, Decimal("12.22"))
+        pony = new_state.apps.get_model(app_label, "pony").objects.create(weight=2)
+        if not connection.features.can_return_columns_from_insert:
+            pony.refresh_from_db()
+        self.assertEqual(pony.height, Decimal("12.22"))
 
     @skipIfDBFeature("interprets_empty_strings_as_nulls")
     def test_alter_field_change_blank_nullable_database_default_to_not_null(self):
@@ -5619,10 +5664,14 @@ class OperationTests(OperationTestBase):
     def _test_invalid_generated_field_changes(self, db_persist):
         regular = models.IntegerField(default=1)
         generated_1 = models.GeneratedField(
-            expression=F("pink") + F("pink"), db_persist=db_persist
+            expression=F("pink") + F("pink"),
+            output_field=models.IntegerField(),
+            db_persist=db_persist,
         )
         generated_2 = models.GeneratedField(
-            expression=F("pink") + F("pink") + F("pink"), db_persist=db_persist
+            expression=F("pink") + F("pink") + F("pink"),
+            output_field=models.IntegerField(),
+            db_persist=db_persist,
         )
         tests = [
             ("test_igfc_1", regular, generated_1),
@@ -5662,12 +5711,20 @@ class OperationTests(OperationTestBase):
             migrations.AddField(
                 "Pony",
                 "modified_pink",
-                models.GeneratedField(expression=F("pink"), db_persist=True),
+                models.GeneratedField(
+                    expression=F("pink"),
+                    output_field=models.IntegerField(),
+                    db_persist=True,
+                ),
             ),
             migrations.AlterField(
                 "Pony",
                 "modified_pink",
-                models.GeneratedField(expression=F("pink"), db_persist=False),
+                models.GeneratedField(
+                    expression=F("pink"),
+                    output_field=models.IntegerField(),
+                    db_persist=False,
+                ),
             ),
         ]
         msg = (
@@ -5684,7 +5741,9 @@ class OperationTests(OperationTestBase):
             "Pony",
             "modified_pink",
             models.GeneratedField(
-                expression=F("pink") + F("pink"), db_persist=db_persist
+                expression=F("pink") + F("pink"),
+                output_field=models.IntegerField(),
+                db_persist=db_persist,
             ),
         )
         project_state, new_state = self.make_test_state(app_label, operation)
@@ -5715,7 +5774,9 @@ class OperationTests(OperationTestBase):
             "Pony",
             "modified_pink",
             models.GeneratedField(
-                expression=F("pink") + F("pink"), db_persist=db_persist
+                expression=F("pink") + F("pink"),
+                output_field=models.IntegerField(),
+                db_persist=db_persist,
             ),
         )
         project_state, new_state = self.make_test_state(app_label, operation)
